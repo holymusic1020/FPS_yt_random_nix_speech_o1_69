@@ -135,21 +135,37 @@ def fb_call(path, params=None, data=None, files=None, method="POST"):
                                timeout=900))
     sep = "&" if "?" in url else "?"
     full = url + sep + urllib.parse.urlencode(params)
+    # IMPORTANT: default to POST for upload-phase calls (start/finish pass
+    # params only, no body). A GET here returns a video LIST {"data":[]} and
+    # the upload never starts. Page reads must pass method="GET" explicitly.
+    method = method if method else "POST"
     return json.loads(http(full, data=urllib.parse.urlencode(data or {}).encode(),
-                           method="POST" if data else "GET", timeout=300))
+                           method=method, timeout=300))
 
 
-def post_fb(kind, vid, mp4_bytes, meta):
-    ep = "video_reels" if kind == "short" else "videos"
-    title = (meta or {}).get("title", "Nix Speech o1")[:100]
-    desc = (meta or {}).get("description", "") or ""
-    credit = (meta or {}).get("music_credit", "")
-    if credit and credit not in desc:
-        desc = f"{desc}\n\n{credit}"
-    print(f"[fb] posting {kind} {vid} -> {ep}: {title}")
-    js = fb_call(f"{PAGE}/{ep}", params={"upload_phase": "start",
-                                         "file_size": len(mp4_bytes)})
+def _rupload(upload_url, data, token):
+    """Direct-upload a full file to a Facebook rupload URL (Reels).
+    NOTE: the offset header here is 'offset' (not 'file_offset') — FB returns
+    'HeaderValuePredicate: Header Offset not convertable to unsigned long'
+    if the wrong header name is used."""
+    req = urllib.request.Request(upload_url, data=data, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("Authorization", f"OAuth {token}")
+    req.add_header("offset", "0")
+    req.add_header("X-Entity-Length", str(len(data)))
+    with urllib.request.urlopen(req, timeout=900) as r:
+        return json.loads(r.read().decode())
+
+
+def _resumable_upload(ep, mp4_bytes, title):
+    """Resumable session upload for {page}/{ep} (used for long 'videos')."""
+    js = fb_call(f"{PAGE}/{ep}",
+                 params={"upload_phase": "start", "file_size": len(mp4_bytes),
+                         "title": title})
+    if "upload_session_id" not in js:
+        raise RuntimeError(f"FB start-phase had no upload_session_id: {json.dumps(js)[:400]}")
     sid = js["upload_session_id"]
+    new_id = js.get("video_id", "")
     off = int(js.get("start_offset", 0))
     size = len(mp4_bytes)
     while off < size:
@@ -163,17 +179,54 @@ def post_fb(kind, vid, mp4_bytes, meta):
         print(f"   {off}/{size}")
     fin = fb_call(f"{PAGE}/{ep}",
                   params={"upload_phase": "finish", "upload_session_id": sid,
-                          "video_id": js.get("video_id", "")})
-    new_id = fin.get("video_id") or js.get("video_id")
-    meta_payload = {"title": title}
-    if desc:
-        meta_payload["description"] = desc[:5000]
-    try:
-        fb_call(str(new_id), data=meta_payload)
-    except Exception as e:
-        print(f"[warn] meta set failed: {e}")
-    print(f"[fb] DONE {kind} id={new_id}")
-    return new_id
+                          "video_id": new_id})
+    return fin.get("video_id") or new_id
+
+
+def post_fb(kind, vid, mp4_bytes, meta):
+    """Post a video to the page. Reels (shorts) use the rupload DIRECT upload
+    protocol; long videos use the resumable-session protocol."""
+    ep = "video_reels" if kind == "short" else "videos"
+    title = (meta or {}).get("title", "Nix Speech o1")[:100]
+    desc = (meta or {}).get("description", "") or ""
+    credit = (meta or {}).get("music_credit", "")
+    if credit and credit not in desc:
+        desc = f"{desc}\n\n{credit}"
+    print(f"[fb] posting {kind} {vid} -> {ep}: {title}")
+
+    # start phase (POST)
+    js = fb_call(f"{PAGE}/{ep}",
+                 params={"upload_phase": "start", "file_size": len(mp4_bytes),
+                         "title": title})
+
+    if kind == "short" and js.get("upload_url"):
+        # ---- Reels: direct upload to rupload ----
+        _rupload(js["upload_url"], mp4_bytes, TOK)
+        print("   direct upload OK")
+        fin = fb_call(f"{PAGE}/{ep}",
+                      params={"upload_phase": "finish",
+                              "video_id": js.get("video_id", ""),
+                              "title": title})
+        if desc:
+            fb_call(f"{PAGE}/{ep}",
+                    params={"upload_phase": "finish",
+                            "video_id": js.get("video_id", ""),
+                            "description": desc[:5000]})
+        new_id = fin.get("post_id") or fin.get("video_id") or js.get("video_id", "")
+        print(f"[fb] DONE {kind} id={new_id}")
+        return new_id
+    else:
+        # ---- Videos (or reels that gave a session): resumable ----
+        new_id = _resumable_upload(ep, mp4_bytes, title)
+        meta_payload = {"title": title}
+        if desc:
+            meta_payload["description"] = desc[:5000]
+        try:
+            fb_call(str(new_id), data=meta_payload)
+        except Exception as e:
+            print(f"[warn] meta set failed: {e}")
+        print(f"[fb] DONE {kind} id={new_id}")
+        return new_id
 
 
 def main():
