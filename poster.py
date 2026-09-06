@@ -203,15 +203,17 @@ def post_fb(kind, vid, mp4_bytes, meta):
         # ---- Reels: direct upload to rupload ----
         _rupload(js["upload_url"], mp4_bytes, TOK)
         print("   direct upload OK")
-        fin = fb_call(f"{PAGE}/{ep}",
-                      params={"upload_phase": "finish",
-                              "video_id": js.get("video_id", ""),
-                              "title": title})
+        # finish ONCE with both title+description (FB rejects a second finish)
+        fparams = {"upload_phase": "finish", "video_id": js.get("video_id", "")}
+        if title:
+            fparams["title"] = title
         if desc:
-            fb_call(f"{PAGE}/{ep}",
-                    params={"upload_phase": "finish",
-                            "video_id": js.get("video_id", ""),
-                            "description": desc[:5000]})
+            fparams["description"] = desc[:5000]
+        try:
+            fin = fb_call(f"{PAGE}/{ep}", params=fparams)
+        except urllib.error.HTTPError as e:
+            print(f"[short] FINISH HTTP {e.code}: {e.read().decode()[:300]}")
+            raise
         new_id = fin.get("post_id") or fin.get("video_id") or js.get("video_id", "")
         print(f"[fb] DONE {kind} id={new_id}")
         return new_id
