@@ -1,0 +1,38 @@
+name: NIX Space wake and health check
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nix-space-keep-awake
+  cancel-in-progress: false
+
+jobs:
+  wake-and-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake if sleeping and verify application health
+        shell: bash
+        run: |
+          set -uo pipefail
+          health='https://mdh-zone-yt-tiktok-nix-speech-o1.hf.space/healthz'
+          metadata='https://huggingface.co/api/spaces/MDH-ZONE/YT-TIKTOK-NIX-SPEECH-o1'
+          echo 'Hugging Face runtime before request (informational):'
+          curl -fsS --max-time 15 "$metadata" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("runtime") or {}).get("stage", "unknown"))' || echo 'Runtime metadata unavailable.'
+          echo 'Requesting /healthz: this may wake an inactivity-sleeping Space.'
+          for attempt in {1..12}; do
+            response="$(curl -fsS --max-time 20 "$health" 2>/dev/null || true)"
+            if printf '%s' "$response" | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if isinstance(d,dict) and d.get("ok") is True else 1)' 2>/dev/null; then
+              echo "PASS: Space reports ok=true (attempt $attempt)."
+              exit 0
+            fi
+            echo "Attempt $attempt/12: not healthy yet; a sleeping Space may be starting."
+            if [ "$attempt" -lt 12 ]; then sleep 20; fi
+          done
+          echo 'FAIL: /healthz did not return ok=true. Check Space status and logs; this does not fix a manually paused Space, build failure, or application error.' >&2
+          exit 1
